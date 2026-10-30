@@ -1,57 +1,50 @@
-"""
-chunker.py — универсальный чанкер для PDF через docling.
+"""Convert PDF text and structured tables into retrieval documents.
 
-Поддерживает:
-- Финансовые отчёты (таблицы с числовыми данными)
-- Любые другие документы (текстовые таблицы → markdown)
-- Автодетект структуры заголовка таблицы
-- Контекст секции документа в каждом чанке
-
-Исправления по сравнению с предыдущей версией:
-- chunker.chunk(doc) вызывается один раз (материализация в список)
-- id(item) заменён на стабильный self_ref для table_contexts
-- merge_broken_rows корректно объединяет значения (первые непустые)
-- _get_chunk_id использует hashlib.md5 вместо hash()
-- Короткие текстовые чанки (< MIN_TEXT_LENGTH символов) отфильтровываются
-- detect_value_columns не помечает пустые колонки как служебные
-- Текстовые чанки получают overlap через _apply_text_overlap()
-- pbar.update считает только новые страницы батча
+Model and conversion dependencies are loaded only when PDF processing starts.
 """
+
+from __future__ import annotations
 
 import gc
 import hashlib
 import json
+import math
 import os
 import re
 import warnings
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Optional
 
-import pypdf
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling_core.transforms.chunker import HybridChunker
-from docling_core.types.doc import DocItemLabel
-from langchain_core.documents import Document
-from tqdm import tqdm
 
-from dockilingTest import tokenizer, MAX_TOKENS_TEXT, SMALL_DOC_PAGES, BATCH_SIZE
+@dataclass
+class Document:
+    page_content: str
+    metadata: dict = field(default_factory=dict)
 
-# Минимальная длина текстового чанка в символах
-MIN_TEXT_LENGTH = 80
+
+SMALL_DOC_PAGES = 10
+BATCH_SIZE = 10
+MAX_TOKENS_TEXT = 512
+TOKENIZER_NAME = "ai-sage/Giga-Embeddings-instruct"
+
 # Количество символов overlap между соседними текстовыми чанками
 TEXT_OVERLAP_CHARS = 150
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # КОНВЕРТАЦИЯ
-# ══════════════════════════════════════════════════════════════════════════════
 
 def get_pdf_pages(pdf_path: str) -> int:
-    return len(pypdf.PdfReader(pdf_path).pages)
+    from pypdf import PdfReader
+
+    return len(PdfReader(pdf_path).pages)
 
 
-def make_converter() -> DocumentConverter:
+def make_converter():
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+
     opts = PdfPipelineOptions()
     opts.do_ocr = False
     opts.do_table_structure = True
@@ -61,27 +54,40 @@ def make_converter() -> DocumentConverter:
 
 
 def convert_pages(pdf_path: str, page_range=None):
+    from docling.datamodel.base_models import ConversionStatus
+
     kwargs = {"source": pdf_path}
     if page_range:
         kwargs["page_range"] = page_range
     result = make_converter().convert(**kwargs)
+    if result.status != ConversionStatus.SUCCESS:
+        raise RuntimeError(f"PDF conversion did not complete: {result.status}")
     doc = result.document
     del result
     gc.collect()
     return doc
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # ПАЙПЛАЙН
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _get_chunk_id(chunk: Document) -> str:
-    """Детерминированный ID чанка через MD5 содержимого."""
-    return hashlib.md5(chunk.page_content.encode("utf-8")).hexdigest()
+    """Deduplicate overlapping batches while retaining different page citations."""
+    identity = {
+        "text": chunk.page_content,
+        "source": chunk.metadata.get("source"),
+        "page": chunk.metadata.get("page"),
+        "type": chunk.metadata.get("type"),
+    }
+    payload = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def process_pdf(pdf_path: str) -> list[Document]:
+    from tqdm import tqdm
+
     num_pages = get_pdf_pages(pdf_path)
+    if num_pages == 0:
+        raise ValueError("PDF contains no pages")
     doc_id = os.path.splitext(os.path.basename(pdf_path))[0]
     print(f"[INFO] {doc_id}: {num_pages} страниц")
 
@@ -96,8 +102,11 @@ def process_pdf(pdf_path: str) -> list[Document]:
                 all_chunks.append(chunk)
 
     if num_pages <= SMALL_DOC_PAGES:
-        doc = convert_pages(pdf_path)
-        _add_chunks(chunk_page(doc, source=pdf_path))
+        try:
+            doc = convert_pages(pdf_path)
+            _add_chunks(chunk_page(doc, source=pdf_path))
+        except MemoryError:
+            _process_batch_recursive(pdf_path, 1, num_pages, _add_chunks)
         return all_chunks
 
     num_batches = (num_pages + BATCH_SIZE - 1) // BATCH_SIZE
@@ -114,8 +123,6 @@ def process_pdf(pdf_path: str) -> list[Document]:
             except MemoryError:
                 tqdm.write(f"[WARN] MemoryError, дробим батч {overlap_start}-{end}...")
                 _process_batch_recursive(pdf_path, overlap_start, end, _add_chunks)
-            except Exception as e:
-                tqdm.write(f"[ERROR] Батч {overlap_start}-{end}: {e}")
             finally:
                 # Обновляем только новые страницы батча, не считая overlap-страницу
                 pbar.update(end - start + 1)
@@ -124,7 +131,12 @@ def process_pdf(pdf_path: str) -> list[Document]:
 
 
 def _process_batch_recursive(pdf_path, start, end, add_fn):
-    if start >= end:
+    if start > end:
+        raise ValueError("Page range must not be empty")
+    if start == end:
+        # Failure on a single page must fail indexing instead of silently losing it.
+        doc = convert_pages(pdf_path, page_range=(start, end))
+        add_fn(chunk_page(doc, source=pdf_path))
         return
     mid = (start + end) // 2
     for s, e in [(start, mid), (mid + 1, end)]:
@@ -133,15 +145,13 @@ def _process_batch_recursive(pdf_path, start, end, add_fn):
             add_fn(chunk_page(doc, source=pdf_path))
         except MemoryError:
             _process_batch_recursive(pdf_path, s, e, add_fn)
-        except Exception as ex:
-            warnings.warn(f"[ERROR] Батч {s}-{e}: {ex}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # ПОСТРОЕНИЕ ГРИДА
-# ══════════════════════════════════════════════════════════════════════════════
 
 def build_grid(table_cells):
+    if not table_cells:
+        return []
     max_row = max(c.end_row_offset_idx for c in table_cells)
     max_col = max(c.end_col_offset_idx for c in table_cells)
     grid = [[None] * max_col for _ in range(max_row)]
@@ -152,9 +162,7 @@ def build_grid(table_cells):
     return grid
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # АВТОДЕТЕКТ СТРУКТУРЫ
-# ══════════════════════════════════════════════════════════════════════════════
 
 def detect_header_rows(grid, max_check: int = 4) -> int:
     """
@@ -185,7 +193,7 @@ def detect_header_rows(grid, max_check: int = 4) -> int:
 
 def find_name_col_count(grid, header_rows: int) -> int:
     """Сколько левых колонок занимает ячейка с названием строки."""
-    if header_rows >= len(grid):
+    if header_rows >= len(grid) or not grid[header_rows]:
         return 1
     first_cell = grid[header_rows][0]
     if first_cell is None:
@@ -211,15 +219,15 @@ def is_numeric_table(rows: list[dict]) -> bool:
     return (numeric / total) >= 0.3
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # ИЗВЛЕЧЕНИЕ ЗАГОЛОВКА И СТРОК
-# ══════════════════════════════════════════════════════════════════════════════
 
 def extract_header(grid, header_rows: int = 1) -> list[str | None]:
     """
     Собирает заголовок из нескольких строк.
     Дедупликация по id ячейки — корректно обрабатывает colspan/rowspan.
     """
+    if not grid:
+        return []
     n_cols = len(grid[0])
     columns = []
     for col_idx in range(n_cols):
@@ -293,7 +301,12 @@ def merge_broken_rows(rows: list[dict]) -> list[dict]:
             buffer = dict(row)
             buffer["values"] = list(row["values"])
             continue
-        if row["name"] and row["name"][0].islower():
+        conflicting_values = any(
+            previous and current
+            for previous, current in zip(buffer["values"], row["values"])
+        )
+        if (row["section"] == buffer["section"] and not conflicting_values and
+                row["name"] and row["name"][0].islower()):
             buffer["name"] += " " + row["name"]
             # Берём значения из продолжения только там, где в буфере пусто
             for i, v in enumerate(row["values"]):
@@ -308,19 +321,21 @@ def merge_broken_rows(rows: list[dict]) -> list[dict]:
     return merged
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_number(x):
-    if not x:
+    if x is None or x == "":
         return None
-    x = x.replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    if isinstance(x, (float, int)):
+        value = float(x)
+        return value if math.isfinite(value) else x
+    x = str(x).replace("\u00a0", "").replace("\u202f", "").replace(" ", "").replace(",", ".")
     if "(" in x:
         x = "-" + x.replace("(", "").replace(")", "")
     try:
-        return float(x)
-    except Exception:
+        value = float(x)
+        return value if math.isfinite(value) else x
+    except ValueError:
         return x
 
 
@@ -337,16 +352,18 @@ def _clean_col_name(col: str | None) -> str | None:
     return str(year) if year else col
 
 
-def detect_value_columns(rows: list[dict], columns: list[str | None],
+def detect_reference_columns(rows: list[dict], columns: list[str | None],
                          max_ref_value: float = 999.0) -> set[str | None]:
-    """
-    Служебные колонки (номера примечаний) — только целые числа <= max_ref_value.
-    Пустые и текстовые колонки НЕ считаются служебными — они могут нести смысл.
-    """
+    """Identify explicitly labelled note columns, retaining small financial values."""
     service_cols: set[str | None] = set()
     for col_idx, col_name in enumerate(columns):
+        if not col_name or _parse_year(col_name):
+            continue
+        if not re.search(r"примеч|note|reference|ссыл", col_name, re.IGNORECASE):
+            continue
         numeric_values = []
         has_any_value = False
+        has_text = False
         for row in rows:
             raw = row["values"][col_idx] if col_idx < len(row["values"]) else None
             if raw:
@@ -354,13 +371,15 @@ def detect_value_columns(rows: list[dict], columns: list[str | None],
             parsed = parse_number(raw)
             if isinstance(parsed, float):
                 numeric_values.append(parsed)
+            elif raw:
+                has_text = True
 
         # Пустая колонка — пропускаем, не помечаем как служебную
         if not has_any_value:
             continue
 
         # Колонка с нечисловыми значениями — не служебная
-        if not numeric_values:
+        if not numeric_values or has_text:
             continue
 
         # Служебная: все значения целые и <= max_ref_value
@@ -373,13 +392,10 @@ def detect_value_columns(rows: list[dict], columns: list[str | None],
 
 def _dedup_ordered(lst: list) -> list:
     """Убирает дубли сохраняя порядок."""
-    seen: set = set()
-    return [x for x in lst if not (x in seen or seen.add(x))]  # type: ignore
+    return list(dict.fromkeys(lst))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # ФОРМИРОВАНИЕ ЧАНКОВ ДЛЯ ЧИСЛОВЫХ ТАБЛИЦ
-# ══════════════════════════════════════════════════════════════════════════════
 
 def make_row_chunks(rows, columns, value_columns, table_name,
                     unit=None, doc_context: str = "") -> list[dict]:
@@ -467,9 +483,7 @@ def to_documents(chunks, source=None, page=None,
     ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # ОБРАБОТКА ТАБЛИЦЫ
-# ══════════════════════════════════════════════════════════════════════════════
 
 def process_table(
         table_item,
@@ -494,6 +508,8 @@ def process_table(
         raise ValueError(f"Неизвестный тип table_item: {type(table_item)}")
 
     grid = build_grid(table_cells)
+    if not grid:
+        return []
 
     if header_rows is None:
         header_rows = detect_header_rows(grid)
@@ -501,13 +517,21 @@ def process_table(
         name_cols = find_name_col_count(grid, header_rows)
 
     header  = extract_header(grid, header_rows=header_rows)
-    columns = header[name_cols:]
+    # Distinct labels preserve each physical column even with repeated/empty headers.
+    columns = []
+    counts: dict[str, int] = {}
+    for position, label in enumerate(header[name_cols:], start=1):
+        label = label or f"column_{position}"
+        counts[label] = counts.get(label, 0) + 1
+        columns.append(label if counts[label] == 1 else f"{label} ({counts[label]})")
 
     rows = extract_rows(grid, header_rows=header_rows, name_cols=name_cols)
     rows = merge_broken_rows(rows)
 
     if not rows:
-        return []
+        return _table_to_markdown_doc(
+            table_item, table_name, source, page, doc_context
+        )
 
     if not is_numeric_table(rows):
         return _table_to_markdown_doc(
@@ -518,8 +542,12 @@ def process_table(
             doc_context=doc_context,
         )
 
-    service_cols  = detect_value_columns(rows, columns, max_ref_value=max_ref_value)
+    service_cols  = detect_reference_columns(rows, columns, max_ref_value=max_ref_value)
     value_columns = _dedup_ordered([c for c in columns if c not in service_cols])
+    if not value_columns:
+        return _table_to_markdown_doc(
+            table_item, table_name, source, page, doc_context
+        )
 
     row_chunks  = make_row_chunks(
         rows, columns, value_columns, table_name, unit, doc_context
@@ -561,21 +589,19 @@ def _table_to_markdown_doc(
     )]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # ОБРАБОТКА ТЕКСТА
-# ══════════════════════════════════════════════════════════════════════════════
 
-_TEXT_CHUNKER = None
+@lru_cache(maxsize=1)
+def _get_text_chunker():
+    from docling_core.transforms.chunker import HybridChunker
+    from transformers import AutoTokenizer
 
-
-def _get_text_chunker() -> HybridChunker:
-    global _TEXT_CHUNKER
-    if _TEXT_CHUNKER is None:
-        _TEXT_CHUNKER = HybridChunker(
-            tokenizer=tokenizer,
-            max_tokens=MAX_TOKENS_TEXT,
-        )
-    return _TEXT_CHUNKER
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    # Tables are processed separately below. Peer merging may combine a table
+    # with adjacent paragraphs, which would then be discarded as a table chunk.
+    return HybridChunker(
+        tokenizer=tokenizer, max_tokens=MAX_TOKENS_TEXT, merge_peers=False
+    )
 
 
 def _is_toc_chunk(text: str) -> bool:
@@ -638,11 +664,16 @@ def _apply_text_overlap(documents: list[Document],
         return documents
 
     text_indices = [i for i, d in enumerate(documents) if d.metadata.get("type") == "text"]
+    original_text = {i: documents[i].page_content for i in text_indices}
 
     for pos in range(1, len(text_indices)):
         prev_idx = text_indices[pos - 1]
         curr_idx = text_indices[pos]
-        prev_text = documents[prev_idx].page_content
+        previous = documents[prev_idx].metadata
+        current = documents[curr_idx].metadata
+        if any(previous.get(key) != current.get(key) for key in ("source", "doc_context")):
+            continue
+        prev_text = original_text[prev_idx]
         tail = prev_text[-overlap_chars:].strip()
         if tail:
             documents[curr_idx] = Document(
@@ -653,9 +684,7 @@ def _apply_text_overlap(documents: list[Document],
     return documents
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # ЕДИНАЯ ТОЧКА ВХОДА
-# ══════════════════════════════════════════════════════════════════════════════
 
 def chunk_page(
         doc,
@@ -685,7 +714,7 @@ def chunk_page(
     table_contexts: dict[str, str] = {}
     for chunk in all_chunks:
         for item in (chunk.meta.doc_items or []):
-            if item.label == DocItemLabel.TABLE:
+            if getattr(item.label, "value", item.label) == "table":
                 ref = _get_stable_table_ref(item)
                 if ref:
                     ctx = _get_doc_context(chunk)
@@ -694,14 +723,15 @@ def chunk_page(
 
     # Текстовые чанки
     for chunk in all_chunks:
-        labels = {item.label for item in (chunk.meta.doc_items or [])}
-        if labels and any(lbl == DocItemLabel.TABLE for lbl in labels):
+        labels = {
+            getattr(item.label, "value", item.label)
+            for item in (chunk.meta.doc_items or [])
+        }
+        if "table" in labels:
             continue
         if not chunk.text or not chunk.text.strip():
             continue
         if _is_toc_chunk(chunk.text):
-            continue
-        if len(chunk.text.strip()) < MIN_TEXT_LENGTH:
             continue
         documents.append(_chunk_text_item(chunk, source=source, page=page))
 
@@ -735,30 +765,8 @@ def chunk_page(
             warnings.warn(
                 f"Не удалось обработать таблицу {tbl_name} стр.{tbl_page}: {e}"
             )
+            documents.extend(_table_to_markdown_doc(
+                table_item, tbl_name, source, tbl_page, doc_context
+            ))
 
     return documents
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ЗАПУСК
-# ══════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    docs = process_pdf("обобщенный отчет сбер за 2025.pdf")
-
-    print(f"\nВсего чанков: {len(docs)}")
-
-    types: dict[str, int] = {}
-    for d in docs:
-        t = d.metadata.get("type", "unknown")
-        types[t] = types.get(t, 0) + 1
-    print(f"Типы: {types}")
-
-    output_path = "сбер.json"
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(
-            [{"page_content": d.page_content, "metadata": d.metadata}
-             for d in docs],
-            f, ensure_ascii=False, indent=2,
-        )
-    print(f"✅ Сохранено {len(docs)} чанков → {output_path}")

@@ -1,0 +1,40 @@
+# Local credentials (only the empty template belongs in Git)
+.env
+.env.*
+!.env.example
+
+# Python, tooling and editors
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+*.egg-info/
+build/
+dist/
+
+# User uploads and generated retrieval data
+runtime/
+uploads/
+sber_chroma_db/
+*.index
+*.pkl
+*.sqlite3
+*.sqlite3-*
+uploaded_files_state.json
+/*_chunks*.json
+/сбер.json
+/тест.json
+/*.pdf
+/*.docx
+/ORU_complete_manual.html
+/new_test/
+
+# Operating system files
+.DS_Store
+Thumbs.db
